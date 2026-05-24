@@ -144,7 +144,8 @@ def _cmd_subscribe(args):
     is_update = name in subs
 
     secret = args.secret or secrets.token_urlsafe(32)
-    events = [e.strip() for e in args.events.split(",")] if args.events else []
+    events = [e.strip() for e in args.events.split(",") if e.strip()] if args.events else []
+    actions = [a.strip() for a in args.actions.split(",") if a.strip()] if args.actions else []
 
     route = {
         "description": args.description or f"Agent-created subscription: {name}",
@@ -155,6 +156,9 @@ def _cmd_subscribe(args):
         "deliver": args.deliver or "log",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+    if actions:
+        route["actions"] = actions
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":
@@ -181,6 +185,8 @@ def _cmd_subscribe(args):
         print(f"  Events: {', '.join(events)}")
     else:
         print("  Events: (all)")
+    if actions:
+        print(f"  Actions: {', '.join(actions)}")
     print(f"  Deliver: {route['deliver']}")
     if route.get("deliver_only"):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
@@ -204,6 +210,7 @@ def _cmd_list(args):
     print(f"\n  {len(subs)} webhook subscription(s):\n")
     for name, route in subs.items():
         events = ", ".join(route.get("events", [])) or "(all)"
+        actions = ", ".join(route.get("actions", [])) or "(all)"
         deliver = route.get("deliver", "log")
         if route.get("deliver_only"):
             deliver = f"{deliver} (direct — no agent)"
@@ -213,6 +220,8 @@ def _cmd_list(args):
             print(f"    {desc}")
         print(f"    URL:     {base_url}/webhooks/{name}")
         print(f"    Events:  {events}")
+        if route.get("actions"):
+            print(f"    Actions: {actions}")
         print(f"    Deliver: {deliver}")
         print()
 

@@ -68,6 +68,7 @@ All management is via the `hermes webhook` CLI command:
 hermes webhook subscribe <name> \
   --prompt "Prompt template with {payload.fields}" \
   --events "event1,event2" \
+  --actions "opened,synchronize" \
   --description "What this does" \
   --skills "skill1,skill2" \
   --deliver telegram \
@@ -125,10 +126,13 @@ Then in GitHub repo Settings → Webhooks → Add webhook:
 ```bash
 hermes webhook subscribe github-prs \
   --events "pull_request" \
+  --actions "opened,reopened,synchronize,ready_for_review" \
   --prompt "PR #{pull_request.number} {action}: {pull_request.title}\nBy: {pull_request.user.login}\nBranch: {pull_request.head.ref}\n\n{pull_request.body}" \
   --skills "github-code-review" \
   --deliver github_comment
 ```
+
+Use `--actions` for broad GitHub event families like `pull_request` so non-actionable events such as `closed`, `labeled`, or `assigned` are accepted/ignored at the webhook boundary instead of spawning full agent runs.
 
 ### Stripe: payment events
 ```bash

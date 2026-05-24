@@ -11854,6 +11854,11 @@ def main():
     wh_sub.add_argument(
         "--events", default="", help="Comma-separated event types to accept"
     )
+    wh_sub.add_argument(
+        "--actions",
+        default="",
+        help="Comma-separated payload action values to accept after event filtering",
+    )
     wh_sub.add_argument("--description", default="", help="What this subscription does")
     wh_sub.add_argument(
         "--skills", default="", help="Comma-separated skill names to load"

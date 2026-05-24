@@ -30,6 +30,7 @@ def _make_args(**kwargs):
         "name": "",
         "prompt": "",
         "events": "",
+        "actions": "",
         "description": "",
         "skills": "",
         "deliver": "log",
@@ -66,6 +67,28 @@ class TestSubscribe:
         assert route["prompt"] == "Issue: {issue.title}"
         assert route["deliver"] == "telegram"
         assert route["deliver_extra"] == {"chat_id": "12345"}
+
+    def test_with_actions_filter(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="gh-prs",
+            events="pull_request",
+            actions="opened,synchronize,reopened,ready_for_review",
+        ))
+        out = capsys.readouterr().out
+        route = _load_subscriptions()["gh-prs"]
+        assert route["events"] == ["pull_request"]
+        assert route["actions"] == [
+            "opened",
+            "synchronize",
+            "reopened",
+            "ready_for_review",
+        ]
+        assert "Actions: opened, synchronize, reopened, ready_for_review" in out
+
+    def test_blank_actions_omitted(self):
+        webhook_command(_make_args(webhook_action="subscribe", name="all-actions"))
+        assert "actions" not in _load_subscriptions()["all-actions"]
 
     def test_custom_secret(self):
         webhook_command(_make_args(
@@ -107,6 +130,19 @@ class TestList:
         assert "2 webhook" in out
         assert "a" in out
         assert "b" in out
+
+    def test_shows_actions_filter(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="gh-prs",
+            events="pull_request",
+            actions="opened,synchronize",
+        ))
+        capsys.readouterr()  # clear
+        webhook_command(_make_args(webhook_action="list"))
+        out = capsys.readouterr().out
+        assert "Events:  pull_request" in out
+        assert "Actions: opened, synchronize" in out
 
 
 class TestRemove:
