@@ -583,6 +583,7 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    reason = _redact_kanban_text(str(reason))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -627,6 +628,8 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    if note is not None:
+        note = _redact_kanban_text(str(note))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

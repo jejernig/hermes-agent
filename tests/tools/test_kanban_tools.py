@@ -768,6 +768,55 @@ def test_comment_redacts_body_before_persisting(worker_env):
     assert "***" in comments[0].body
 
 
+def test_block_redacts_reason_before_persisting(worker_env):
+    """Block reasons are stored as run summaries and event payloads, both of
+    which can be shown back to workers through kanban_show / retry context.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "block_" + "abcdefghijklmnopqrstuvwxyz123456"
+    out = kt._handle_block({
+        "reason": f"waiting on OPENAI_API_KEY={raw_key}",
+    })
+    assert json.loads(out)["ok"] is True
+
+    with kb.connect() as conn:
+        runs = kb.list_runs(conn, worker_env)
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"]
+        shown = json.loads(kt._handle_show({"task_id": worker_env}))
+
+    assert runs
+    assert events
+    assert raw_key not in (runs[-1].summary or "")
+    assert raw_key not in json.dumps(events[-1].payload or {})
+    assert raw_key not in json.dumps(shown)
+    assert "***" in (runs[-1].summary or "")
+
+
+def test_heartbeat_redacts_note_before_persisting(worker_env):
+    """Heartbeat notes are recent event payloads surfaced by kanban_show, so
+    token-shaped values must be masked before SQLite persistence.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "heartbeat_" + "abcdefghijklmnopqrstuvwxyz123456"
+    out = kt._handle_heartbeat({
+        "note": f"still running with OPENAI_API_KEY={raw_key}",
+    })
+    assert json.loads(out)["ok"] is True
+
+    with kb.connect() as conn:
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "heartbeat"]
+        shown = json.loads(kt._handle_show({"task_id": worker_env}))
+
+    assert events
+    assert raw_key not in json.dumps(events[-1].payload or {})
+    assert raw_key not in json.dumps(shown)
+    assert "***" in json.dumps(events[-1].payload or {})
+
+
 def test_comment_rejects_empty_body(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({"task_id": worker_env, "body": "   "})
