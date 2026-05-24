@@ -727,6 +727,8 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
+    if workspace_path is not None:
+        workspace_path = _redact_kanban_text(str(workspace_path))
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)

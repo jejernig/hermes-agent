@@ -908,6 +908,35 @@ def test_create_redacts_title_and_body_before_persisting(worker_env):
     assert "***" in (task.body or "")
 
 
+def test_create_redacts_workspace_path_before_persisting(worker_env):
+    """Workspace paths are rendered into worker context, so token-like
+    values supplied through kanban_create must be masked before storage.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "workspace_" + "abcdefghijklmnopqrstuvwxyz123456"
+    out = kt._handle_create({
+        "title": "child with workspace",
+        "assignee": "peer",
+        "workspace_kind": "worktree",
+        "workspace_path": f"/tmp/repo?OPENAI_API_KEY={raw_key}",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+        context = kb.build_worker_context(conn, d["task_id"])
+        shown = json.loads(kt._handle_show({"task_id": d["task_id"]}))
+
+    assert task is not None
+    assert raw_key not in (task.workspace_path or "")
+    assert raw_key not in context
+    assert raw_key not in json.dumps(shown)
+    assert "***" in (task.workspace_path or "")
+
+
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
     """When the agent loop runs under ACP, the server propagates the
     originating chat session id via HERMES_SESSION_ID. ``kanban_create``
