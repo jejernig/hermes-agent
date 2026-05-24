@@ -5915,7 +5915,26 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 
-    return "\n".join(lines).rstrip() + "\n"
+    return _redact_worker_context_text("\n".join(lines).rstrip() + "\n")
+
+
+def _redact_worker_context_text(value: str) -> str:
+    """Redact secrets from dispatcher-injected worker-context text.
+
+    Tool handlers redact new writes before persistence, but the dispatcher calls
+    build_worker_context() directly and boards can contain legacy/CLI-written
+    rows. Keep a final model-facing boundary here so raw prompt material is not
+    injected into spawned workers.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(value, force=True)
+    except Exception:
+        # Do not break dispatch if the optional redactor import fails during
+        # early startup or partial test environments; callers still get the
+        # context rather than a crashed worker spawn.
+        return value
 
 
 # ---------------------------------------------------------------------------

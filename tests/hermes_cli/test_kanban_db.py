@@ -995,6 +995,45 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
     assert "child" in ctx
 
 
+def test_worker_context_redacts_legacy_prompt_material_before_spawn(kanban_home):
+    """Dispatcher-spawned worker context must mask legacy/CLI rows too.
+
+    Tool-boundary redaction protects new kanban_* writes, but operators and
+    old Hermes versions can leave raw prompt material in SQLite. The dispatcher
+    injects build_worker_context() directly into the worker prompt, so the DB
+    layer needs a final model-facing redaction boundary as well.
+    """
+    raw_key = "sk-" + "test_" + "abcdefghijklmnopqrstuvwxyz123456"
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None
+        kb.complete_task(
+            conn,
+            parent,
+            summary=f"parent summary OPENAI_API_KEY={raw_key}",
+            metadata={"access_token": raw_key},
+            expected_run_id=claimed.current_run_id,
+        )
+        kb.add_comment(conn, child, "operator", f"comment OPENAI_API_KEY={raw_key}")
+        conn.execute(
+            "UPDATE tasks SET title = ?, body = ?, workspace_path = ?, branch_name = ? WHERE id = ?",
+            (
+                f"child title {raw_key}",
+                f"body OPENAI_API_KEY={raw_key}",
+                f"/tmp/work?token={raw_key}",
+                f"wt/{raw_key}",
+                child,
+            ),
+        )
+        conn.commit()
+        ctx = kb.build_worker_context(conn, child)
+
+    assert raw_key not in ctx
+    assert "***" in ctx
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
