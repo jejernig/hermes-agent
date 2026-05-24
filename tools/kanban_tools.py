@@ -279,24 +279,29 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
-    """Compact task shape for board-listing tools."""
+    """Compact task shape for board-listing tools.
+
+    ``kanban_list`` output is fed straight back to the model, so redact
+    prompt-material fields here as a defence-in-depth layer for legacy rows
+    that predate tool-boundary persistence redaction.
+    """
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
         "id": task.id,
-        "title": task.title,
+        "title": _redact_kanban_text(task.title),
         "assignee": task.assignee,
         "status": task.status,
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
-        "workspace_path": task.workspace_path,
+        "workspace_path": _redact_kanban_text(task.workspace_path),
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
-        "model_override": task.model_override,
+        "model_override": _redact_kanban_payload(task.model_override),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -331,25 +336,28 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _task_dict(t):
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                    "id": t.id,
+                    "title": _redact_kanban_text(t.title),
+                    "body": _redact_kanban_text(t.body),
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
+                    "workspace_path": _redact_kanban_text(t.workspace_path),
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
-                    "result": t.result,
+                    "result": _redact_kanban_text(t.result),
                     "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
+                    "model_override": _redact_kanban_payload(t.model_override),
                 }
 
             def _run_dict(r):
                 return {
                     "id": r.id, "profile": r.profile,
                     "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
+                    "summary": _redact_kanban_text(r.summary),
+                    "error": _redact_kanban_text(r.error),
+                    "metadata": _redact_kanban_payload(r.metadata),
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
@@ -358,12 +366,14 @@ def _handle_show(args: dict, **kw) -> str:
                 "parents": parents,
                 "children": children,
                 "comments": [
-                    {"author": c.author, "body": c.body,
+                    {"author": c.author,
+                     "body": _redact_kanban_text(c.body),
                      "created_at": c.created_at}
                     for c in comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
+                    {"kind": e.kind,
+                     "payload": _redact_kanban_payload(e.payload),
                      "created_at": e.created_at, "run_id": e.run_id}
                     for e in events[-50:]   # cap; full log via CLI
                 ],
@@ -372,7 +382,9 @@ def _handle_show(args: dict, **kw) -> str:
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
+                "worker_context": _redact_kanban_text(
+                    kb.build_worker_context(conn, tid)
+                ),
             })
         finally:
             conn.close()

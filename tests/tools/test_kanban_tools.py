@@ -196,6 +196,68 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_show_redacts_legacy_prompt_material_on_output(worker_env):
+    """kanban_show is itself prompt material, so it must mask secret-like
+    values even if older rows were written before tool-boundary redaction.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "legacy_show_" + "abcdefghijklmnopqrstuvwxyz123456"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title=f"rotate {raw_key}",
+            body=f"body has OPENAI_API_KEY={raw_key}",
+            assignee="peer",
+            workspace_kind="dir",
+            workspace_path=f"/tmp/work?token={raw_key}",
+        )
+        kb.add_comment(conn, tid, "operator", f"comment has {raw_key}")
+        kb.claim_task(conn, tid)
+        kb.complete_task(
+            conn,
+            tid,
+            summary=f"summary has {raw_key}",
+            metadata={"access_token": raw_key, "nested": [raw_key]},
+        )
+
+    out = kt._handle_show({"task_id": tid})
+    shown = json.loads(out)
+    dumped = json.dumps(shown)
+
+    assert raw_key not in dumped
+    assert "***" in dumped
+    assert shown["task"]["id"] == tid
+
+
+def test_list_redacts_legacy_prompt_material_on_output(monkeypatch, worker_env):
+    """Orchestrator board discovery output is model-facing prompt material;
+    redact legacy raw task titles and workspace paths before returning it.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "legacy_list_" + "abcdefghijklmnopqrstuvwxyz123456"
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title=f"legacy title {raw_key}",
+            assignee="factory",
+            workspace_kind="dir",
+            workspace_path=f"/tmp/list?OPENAI_API_KEY={raw_key}",
+        )
+
+    out = kt._handle_list({"assignee": "factory", "status": "ready", "limit": 10})
+    shown = json.loads(out)
+    dumped = json.dumps(shown)
+
+    assert tid in [task["id"] for task in shown["tasks"]]
+    assert raw_key not in dumped
+    assert "***" in dumped
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
