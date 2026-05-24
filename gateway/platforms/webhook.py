@@ -27,13 +27,18 @@ Security:
 """
 
 import asyncio
+import datetime as _dt
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 try:
@@ -137,6 +142,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
+
+        # Optional Drip visibility. Disabled by default. When enabled, webhook
+        # acceptance emits a small sanitized envelope keyed by delivery_id.
+        # Emission is best-effort and must never fail the webhook request path.
+        self._drip_observability: Dict[str, Any] = config.extra.get(
+            "drip_observability", {}
+        ) or {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -356,6 +368,15 @@ class WebhookAdapter(BasePlatformAdapter):
 
         route_name = request.match_info.get("route_name", "")
         route_config = self._routes.get(route_name)
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+        )
+        header_event_type = (
+            request.headers.get("X-GitHub-Event", "")
+            or request.headers.get("X-GitLab-Event", "")
+            or "unknown"
+        )
 
         if not route_config:
             return web.json_response(
@@ -383,6 +404,14 @@ class WebhookAdapter(BasePlatformAdapter):
             if not self._validate_signature(request, raw_body, secret):
                 logger.warning(
                     "[webhook] Invalid signature for route %s", route_name
+                )
+                self._schedule_drip_observability(
+                    route_name=route_name,
+                    event_type=header_event_type,
+                    delivery_id=delivery_id,
+                    outcome="rejected",
+                    severity="warning",
+                    payload={"reason": "invalid_signature"},
                 )
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
@@ -429,8 +458,43 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_name,
                 allowed_events,
             )
+            self._schedule_drip_observability(
+                route_name=route_name,
+                event_type=event_type,
+                delivery_id=delivery_id,
+                outcome="ignored",
+                severity="info",
+                payload=payload,
+            )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
+            )
+
+        # Optional action filter for event families such as GitHub
+        # ``pull_request``. GitHub sends many actions under the same event
+        # name (opened, synchronize, closed, etc.). Routes that only need
+        # actionable PR events can list accepted actions and avoid spawning
+        # expensive background agent runs for merge/close notifications.
+        allowed_actions = route_config.get("actions", [])
+        action = payload.get("action")
+        if allowed_actions and action not in allowed_actions:
+            logger.info(
+                "[webhook] Ignoring action %s for event %s route %s (allowed: %s)",
+                action,
+                event_type,
+                route_name,
+                allowed_actions,
+            )
+            self._schedule_drip_observability(
+                route_name=route_name,
+                event_type=event_type,
+                delivery_id=delivery_id,
+                outcome="ignored",
+                severity="info",
+                payload={"reason": "action_filter", "action": action},
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "action": action}
             )
 
         # Format prompt from template
@@ -469,10 +533,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
         # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-        )
+        # Computed near the start of the request so rejected/ignored events can
+        # still be correlated in Drip.
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
@@ -594,6 +656,15 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
+        self._schedule_drip_observability(
+            route_name=route_name,
+            event_type=event_type,
+            delivery_id=delivery_id,
+            outcome="accepted",
+            severity="info",
+            payload=payload,
+        )
+
         # Non-blocking — return 202 Accepted immediately
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
@@ -699,6 +770,187 @@ class WebhookAdapter(BasePlatformAdapter):
             else:
                 rendered[key] = value
         return rendered
+
+    # ------------------------------------------------------------------
+    # Optional Drip observability
+    # ------------------------------------------------------------------
+
+    def _drip_enabled(self) -> bool:
+        return bool(self._drip_observability.get("enabled"))
+
+    def _schedule_drip_observability(
+        self,
+        *,
+        route_name: str,
+        event_type: str,
+        delivery_id: str,
+        outcome: str,
+        severity: str,
+        payload: dict,
+    ) -> None:
+        """Emit sanitized webhook visibility to Drip without blocking POSTs."""
+        if not self._drip_enabled():
+            return
+        envelope = self._build_drip_envelope(
+            route_name=route_name,
+            event_type=event_type,
+            delivery_id=delivery_id,
+            outcome=outcome,
+            severity=severity,
+            payload=payload,
+        )
+        task = asyncio.create_task(self._post_drip_envelope(envelope))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _build_drip_envelope(
+        self,
+        *,
+        route_name: str,
+        event_type: str,
+        delivery_id: str,
+        outcome: str,
+        severity: str,
+        payload: dict,
+    ) -> dict:
+        source_service = self._drip_observability.get(
+            "source_service", "hermes-webhook"
+        )
+        source_vm = self._drip_observability.get("source_vm", "unknown")
+        event_category = self._drip_observability.get("event_category", "webhook")
+        return {
+            "timestamp_utc": _dt.datetime.now(_dt.UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "source_service": source_service,
+            "source_vm": source_vm,
+            "event_category": event_category,
+            "event_type": f"{event_type}.{outcome}",
+            "severity": severity,
+            "correlation_id": delivery_id,
+            "payload": self._sanitize_webhook_payload(
+                route_name=route_name,
+                event_type=event_type,
+                delivery_id=delivery_id,
+                outcome=outcome,
+                payload=payload,
+            ),
+            "idempotency_key": f"webhook-{route_name}-{delivery_id}-{outcome}",
+        }
+
+    def _sanitize_webhook_payload(
+        self,
+        *,
+        route_name: str,
+        event_type: str,
+        delivery_id: str,
+        outcome: str,
+        payload: dict,
+    ) -> dict:
+        """Return only low-risk routing/correlation metadata for Drip."""
+        repo = payload.get("repository") if isinstance(payload, dict) else None
+        pr = payload.get("pull_request") if isinstance(payload, dict) else None
+        sender = payload.get("sender") if isinstance(payload, dict) else None
+        safe: Dict[str, Any] = {
+            "route": route_name,
+            "event": event_type,
+            "outcome": outcome,
+            "delivery_id": delivery_id,
+        }
+        if isinstance(repo, dict) and repo.get("full_name") is not None:
+            safe["repository"] = repo.get("full_name")
+        if isinstance(pr, dict):
+            if pr.get("number") is not None:
+                safe["pr_number"] = pr.get("number")
+            if pr.get("html_url") is not None:
+                safe["pr_url"] = pr.get("html_url")
+        if isinstance(sender, dict) and sender.get("login") is not None:
+            safe["sender"] = sender.get("login")
+        if isinstance(payload, dict):
+            reason = payload.get("reason")
+            if reason in {"action_filter", "invalid_signature"}:
+                safe["reason"] = reason
+            if reason == "action_filter" and payload.get("action") is not None:
+                safe["action"] = payload.get("action")
+        return safe
+
+    async def _post_drip_envelope(self, envelope: dict) -> None:
+        """Best-effort POST to Drip event API, configured by env/config.
+
+        Configuration keys under platforms.webhook.extra.drip_observability:
+          - event_api_url: full URL to /events, or base URL containing /events
+          - bearer_token_env: env var containing bearer token (default DRIP_API_TOKEN)
+
+        If bearer_token_env is unset, the emitter falls back to the Drip OIDC
+        service-account convention: OIDC_TOKEN_URL, OIDC_CLIENT_ID, and either
+        OIDC_CLIENT_SECRET or BREWER_INTERNAL_CLIENT_SECRET.
+        """
+        url = str(self._drip_observability.get("event_api_url", "")).strip()
+        if not url:
+            return
+        if not url.rstrip("/").endswith("/events"):
+            url = url.rstrip("/") + "/events"
+
+        def _token_from_env() -> str:
+            token_env = str(
+                self._drip_observability.get("bearer_token_env", "DRIP_API_TOKEN")
+            )
+            token = os.environ.get(token_env, "").strip()
+            if token:
+                return token
+
+            token_url = os.environ.get("OIDC_TOKEN_URL", "").strip()
+            client_id = os.environ.get("OIDC_CLIENT_ID", "").strip()
+            client_secret = (
+                os.environ.get("OIDC_CLIENT_SECRET", "").strip()
+                or os.environ.get("BREWER_INTERNAL_CLIENT_SECRET", "").strip()
+            )
+            if not (token_url and client_id and client_secret):
+                logger.debug(
+                    "[webhook] Drip observability enabled but neither %s nor OIDC env is set",
+                    token_env,
+                )
+                return ""
+
+            body = urllib.parse.urlencode(
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                token_url,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                doc = json.loads(resp.read().decode("utf-8"))
+            return str(doc.get("access_token", "")).strip()
+
+        def _post() -> None:
+            token = _token_from_env()
+            if not token:
+                return
+            body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status not in (200, 201):
+                    raise RuntimeError(f"drip-event-api returned HTTP {resp.status}")
+
+        try:
+            await asyncio.to_thread(_post)
+        except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError) as e:
+            logger.warning("[webhook] Drip observability emit failed: %s", e)
 
     # ------------------------------------------------------------------
     # Response delivery

@@ -304,6 +304,58 @@ class TestEventFilter:
             )
             assert resp.status == 202
 
+    @pytest.mark.asyncio
+    async def test_action_filter_accepts_matching_action(self):
+        """Matching action passes through after event filtering."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "opened"},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 202
+            adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_action_filter_ignores_non_matching_action(self):
+        """Non-matching actions return ignored without spawning an agent run."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "closed"},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            assert data["event"] == "pull_request"
+            assert data["action"] == "closed"
+            adapter.handle_message.assert_not_called()
+
 
 # ===================================================================
 # HTTP handling
