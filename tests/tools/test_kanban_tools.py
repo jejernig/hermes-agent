@@ -337,6 +337,44 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["runs"][-1]["metadata"] == handoff
 
 
+def test_complete_redacts_secret_payloads_before_persisting(worker_env):
+    """Kanban completion payloads are injected into future worker prompts,
+    so secrets must be redacted before they land in SQLite.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "test_" + "abcdefghijklmnopqrstuvwxyz123456"
+    opaque_token = "opaque-token-" + "12345"
+    complete_out = kt._handle_complete({
+        "summary": f"used key {raw_key}",
+        "result": f"OPENAI_API_KEY={raw_key}",
+        "metadata": {
+            "password": "hunter2",
+            "nested": {
+                "callback": f"https://example.test/hook?access_token={opaque_token}",
+            },
+        },
+    })
+    assert json.loads(complete_out)["ok"] is True
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+        task = kb.get_task(conn, worker_env)
+
+    assert run is not None
+    assert task is not None
+    persisted = json.dumps({
+        "summary": run.summary,
+        "result": task.result,
+        "metadata": run.metadata,
+    })
+    assert raw_key not in persisted
+    assert "hunter2" not in persisted
+    assert opaque_token not in persisted
+    assert "***" in persisted
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 

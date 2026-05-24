@@ -129,6 +129,62 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _redact_kanban_text(value: Optional[str]) -> Optional[str]:
+    """Redact secrets from text before it is persisted to the Kanban DB."""
+    if value is None:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str(value), force=True)
+
+
+def _redact_kanban_payload(value: Any) -> Any:
+    """Redact secrets from structured Kanban handoff payloads.
+
+    Completion metadata and event payloads are replayed into future worker
+    prompts, so they need a safety boundary independent of the operator's
+    global log-redaction preference. Serialising first lets the canonical
+    redactor catch sensitive JSON keys such as ``password`` as well as
+    token-shaped values embedded in nested strings.
+    """
+    if value is None:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    try:
+        encoded = json.dumps(value)
+        redacted = redact_sensitive_text(encoded, force=True)
+        return json.loads(redacted)
+    except Exception:
+        return _redact_kanban_payload_recursive(value)
+
+
+def _redact_kanban_payload_recursive(value: Any, *, key: Optional[str] = None) -> Any:
+    """Fallback redactor that preserves JSON shape when whole-object
+    redaction creates non-JSON text (for example URL query redaction inside
+    an already-encoded JSON string).
+    """
+    sensitive_keys = {
+        "access_token", "refresh_token", "id_token", "token",
+        "api_key", "apikey", "client_secret", "password", "auth",
+        "jwt", "secret", "private_key", "authorization", "key",
+    }
+    if key and key.lower() in sensitive_keys:
+        return "***"
+    from agent.redact import redact_sensitive_text
+
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, dict):
+        return {
+            k: _redact_kanban_payload_recursive(v, key=str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_kanban_payload_recursive(v) for v in value]
+    return value
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -465,6 +521,9 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    summary = _redact_kanban_text(summary)
+    result = _redact_kanban_text(result)
+    metadata = _redact_kanban_payload(metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
