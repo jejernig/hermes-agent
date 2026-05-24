@@ -670,6 +670,7 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
+    body = _redact_kanban_text(str(body))
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
@@ -684,7 +685,7 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            cid = kb.add_comment(conn, tid, author=author, body=body or "")
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
@@ -704,6 +705,7 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    title = _redact_kanban_text(str(title).strip()) or "***"
     assignee = args.get("assignee")
     if not assignee:
         return tool_error(
@@ -711,6 +713,8 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    if body is not None:
+        body = _redact_kanban_text(str(body))
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -746,7 +750,7 @@ def _handle_create(args: dict, **kw) -> str:
         try:
             new_tid = kb.create_task(
                 conn,
-                title=str(title).strip(),
+                title=title,
                 body=body,
                 assignee=str(assignee),
                 parents=tuple(parents),

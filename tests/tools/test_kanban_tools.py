@@ -745,6 +745,29 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_redacts_body_before_persisting(worker_env):
+    """Comments are replayed into future worker context, so secret-like
+    values in comment bodies must be redacted before they land in SQLite.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw_key = "sk-" + "comment_" + "abcdefghijklmnopqrstuvwxyz123456"
+    out = kt._handle_comment({
+        "task_id": worker_env,
+        "body": f"handoff credential OPENAI_API_KEY={raw_key}",
+    })
+    assert json.loads(out)["ok"] is True
+
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, worker_env)
+        context = kb.build_worker_context(conn, worker_env)
+
+    assert raw_key not in comments[0].body
+    assert raw_key not in context
+    assert "***" in comments[0].body
+
+
 def test_comment_rejects_empty_body(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({"task_id": worker_env, "body": "   "})
@@ -804,6 +827,36 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_redacts_title_and_body_before_persisting(worker_env):
+    """Task titles/bodies are injected into worker prompts and board views,
+    so secret-like values must be redacted on create.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    title_key = "sk-" + "title_" + "abcdefghijklmnopqrstuvwxyz123456"
+    body_key = "sk-" + "body_" + "abcdefghijklmnopqrstuvwxyz123456"
+    out = kt._handle_create({
+        "title": f"rotate {title_key}",
+        "body": f"details OPENAI_API_KEY={body_key}",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+        context = kb.build_worker_context(conn, d["task_id"])
+
+    assert task is not None
+    assert title_key not in task.title
+    assert body_key not in (task.body or "")
+    assert title_key not in context
+    assert body_key not in context
+    assert "..." in task.title
+    assert "***" in (task.body or "")
 
 
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
