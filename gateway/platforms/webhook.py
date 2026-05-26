@@ -39,10 +39,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 try:
+    import aiohttp
     from aiohttp import web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
+    aiohttp = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
@@ -139,6 +141,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
+
+        # Optional Team Teddy / Drip-style event emission for webhook
+        # intake outcomes. Disabled unless explicitly configured so normal
+        # webhook handling remains side-effect free.
+        self._drip_observability: Dict[str, Any] = config.extra.get(
+            "drip_observability", {}
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -292,6 +301,124 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
+    def _request_event_type(self, request, payload: dict) -> str:
+        """Return the provider event type without exposing body secrets."""
+        return (
+            request.headers.get("X-GitHub-Event", "")
+            or request.headers.get("X-GitLab-Event", "")
+            or payload.get("event_type", "")
+            or payload.get("type", "")
+            or "unknown"
+        )
+
+    def _request_delivery_id(self, request) -> str:
+        """Return the provider delivery/request id used for correlation."""
+        return request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+    def _build_drip_payload(
+        self,
+        route: str,
+        event: str,
+        outcome: str,
+        delivery_id: str,
+        body: dict,
+        *,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a sanitized webhook intake payload for Drip observability."""
+        payload: Dict[str, Any] = {
+            "route": route,
+            "event": event,
+            "outcome": outcome,
+            "delivery_id": delivery_id,
+        }
+        if reason:
+            payload["reason"] = reason
+            return payload
+
+        repository = body.get("repository")
+        if isinstance(repository, dict) and repository.get("full_name"):
+            payload["repository"] = repository["full_name"]
+
+        pull_request = body.get("pull_request")
+        if isinstance(pull_request, dict):
+            if pull_request.get("number") is not None:
+                payload["pr_number"] = pull_request["number"]
+            if pull_request.get("title"):
+                payload["pr_title"] = pull_request["title"]
+            if pull_request.get("html_url"):
+                payload["pr_url"] = pull_request["html_url"]
+
+        sender = body.get("sender")
+        if isinstance(sender, dict) and sender.get("login"):
+            payload["sender"] = sender["login"]
+
+        return payload
+
+    async def _emit_drip_envelope(
+        self,
+        *,
+        route: str,
+        event: str,
+        outcome: str,
+        delivery_id: str,
+        payload: Dict[str, Any],
+        severity: str = "info",
+    ) -> None:
+        """Emit a sanitized Drip-style envelope when explicitly enabled."""
+        config = self._drip_observability or {}
+        if not config.get("enabled"):
+            return
+
+        envelope = {
+            "source_service": config.get("source_service", "hermes-webhook"),
+            "source_vm": config.get("source_vm", "unknown"),
+            "event_category": config.get("event_category", "webhook"),
+            "event_type": f"{event}.{outcome}",
+            "severity": severity,
+            "correlation_id": delivery_id,
+            "idempotency_key": f"webhook-{route}-{delivery_id}-{outcome}",
+            "payload": payload,
+        }
+        try:
+            await self._post_drip_envelope(envelope)
+        except Exception:
+            logger.exception(
+                "[webhook] Failed to emit drip envelope route=%s delivery=%s",
+                route,
+                delivery_id,
+            )
+
+    async def _post_drip_envelope(self, envelope: Dict[str, Any]) -> None:
+        """POST a Drip envelope to the configured endpoint, if one is set."""
+        endpoint = (self._drip_observability or {}).get("endpoint", "")
+        if not endpoint:
+            return
+        timeout = float((self._drip_observability or {}).get("timeout_seconds", 3))
+        headers = dict((self._drip_observability or {}).get("headers", {}))
+        if aiohttp is None:
+            logger.warning("[webhook] aiohttp unavailable; cannot POST Drip envelope")
+            return
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                endpoint,
+                json=envelope,
+                headers=headers or None,
+                timeout=client_timeout,
+            ) as response:
+                if response.status >= 400:
+                    logger.warning(
+                        "[webhook] Drip envelope POST failed status=%s",
+                        response.status,
+                    )
+
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
         from hermes_constants import get_hermes_home
@@ -398,6 +525,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[webhook] Invalid signature for route %s", route_name
                 )
+                delivery_id = self._request_delivery_id(request)
+                event_type = self._request_event_type(request, {})
+                await self._emit_drip_envelope(
+                    route=route_name,
+                    event=event_type,
+                    outcome="rejected",
+                    delivery_id=delivery_id,
+                    severity="warning",
+                    payload=self._build_drip_payload(
+                        route_name,
+                        event_type,
+                        "rejected",
+                        delivery_id,
+                        {},
+                        reason="invalid_signature",
+                    ),
+                )
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
                 )
@@ -429,13 +573,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         # Check event type filter
-        event_type = (
-            request.headers.get("X-GitHub-Event", "")
-            or request.headers.get("X-GitLab-Event", "")
-            or payload.get("event_type", "")
-            or payload.get("type", "")
-            or "unknown"
-        )
+        event_type = self._request_event_type(request, payload)
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -443,6 +581,16 @@ class WebhookAdapter(BasePlatformAdapter):
                 event_type,
                 route_name,
                 allowed_events,
+            )
+            delivery_id = self._request_delivery_id(request)
+            await self._emit_drip_envelope(
+                route=route_name,
+                event=event_type,
+                outcome="ignored",
+                delivery_id=delivery_id,
+                payload=self._build_drip_payload(
+                    route_name, event_type, "ignored", delivery_id, payload
+                ),
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
@@ -610,6 +758,16 @@ class WebhookAdapter(BasePlatformAdapter):
             route_name,
             len(prompt),
             delivery_id,
+        )
+
+        await self._emit_drip_envelope(
+            route=route_name,
+            event=event_type,
+            outcome="accepted",
+            delivery_id=delivery_id,
+            payload=self._build_drip_payload(
+                route_name, event_type, "accepted", delivery_id, payload
+            ),
         )
 
         # Non-blocking — return 202 Accepted immediately
