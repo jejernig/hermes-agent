@@ -27,6 +27,8 @@ Security:
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -37,10 +39,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 try:
+    import aiohttp
     from aiohttp import web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:
+    aiohttp = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
@@ -137,6 +141,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
+
+        # Optional Team Teddy / Drip-style event emission for webhook
+        # intake outcomes. Disabled unless explicitly configured so normal
+        # webhook handling remains side-effect free.
+        self._drip_observability: Dict[str, Any] = config.extra.get(
+            "drip_observability", {}
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -290,6 +301,124 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
+    def _request_event_type(self, request, payload: dict) -> str:
+        """Return the provider event type without exposing body secrets."""
+        return (
+            request.headers.get("X-GitHub-Event", "")
+            or request.headers.get("X-GitLab-Event", "")
+            or payload.get("event_type", "")
+            or payload.get("type", "")
+            or "unknown"
+        )
+
+    def _request_delivery_id(self, request) -> str:
+        """Return the provider delivery/request id used for correlation."""
+        return request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+    def _build_drip_payload(
+        self,
+        route: str,
+        event: str,
+        outcome: str,
+        delivery_id: str,
+        body: dict,
+        *,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a sanitized webhook intake payload for Drip observability."""
+        payload: Dict[str, Any] = {
+            "route": route,
+            "event": event,
+            "outcome": outcome,
+            "delivery_id": delivery_id,
+        }
+        if reason:
+            payload["reason"] = reason
+            return payload
+
+        repository = body.get("repository")
+        if isinstance(repository, dict) and repository.get("full_name"):
+            payload["repository"] = repository["full_name"]
+
+        pull_request = body.get("pull_request")
+        if isinstance(pull_request, dict):
+            if pull_request.get("number") is not None:
+                payload["pr_number"] = pull_request["number"]
+            if pull_request.get("title"):
+                payload["pr_title"] = pull_request["title"]
+            if pull_request.get("html_url"):
+                payload["pr_url"] = pull_request["html_url"]
+
+        sender = body.get("sender")
+        if isinstance(sender, dict) and sender.get("login"):
+            payload["sender"] = sender["login"]
+
+        return payload
+
+    async def _emit_drip_envelope(
+        self,
+        *,
+        route: str,
+        event: str,
+        outcome: str,
+        delivery_id: str,
+        payload: Dict[str, Any],
+        severity: str = "info",
+    ) -> None:
+        """Emit a sanitized Drip-style envelope when explicitly enabled."""
+        config = self._drip_observability or {}
+        if not config.get("enabled"):
+            return
+
+        envelope = {
+            "source_service": config.get("source_service", "hermes-webhook"),
+            "source_vm": config.get("source_vm", "unknown"),
+            "event_category": config.get("event_category", "webhook"),
+            "event_type": f"{event}.{outcome}",
+            "severity": severity,
+            "correlation_id": delivery_id,
+            "idempotency_key": f"webhook-{route}-{delivery_id}-{outcome}",
+            "payload": payload,
+        }
+        try:
+            await self._post_drip_envelope(envelope)
+        except Exception:
+            logger.exception(
+                "[webhook] Failed to emit drip envelope route=%s delivery=%s",
+                route,
+                delivery_id,
+            )
+
+    async def _post_drip_envelope(self, envelope: Dict[str, Any]) -> None:
+        """POST a Drip envelope to the configured endpoint, if one is set."""
+        endpoint = (self._drip_observability or {}).get("endpoint", "")
+        if not endpoint:
+            return
+        timeout = float((self._drip_observability or {}).get("timeout_seconds", 3))
+        headers = dict((self._drip_observability or {}).get("headers", {}))
+        if aiohttp is None:
+            logger.warning("[webhook] aiohttp unavailable; cannot POST Drip envelope")
+            return
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                endpoint,
+                json=envelope,
+                headers=headers or None,
+                timeout=client_timeout,
+            ) as response:
+                if response.status >= 400:
+                    logger.warning(
+                        "[webhook] Drip envelope POST failed status=%s",
+                        response.status,
+                    )
+
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
         from hermes_constants import get_hermes_home
@@ -377,12 +506,41 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Failed to read body: %s", e)
             return web.json_response({"error": "Bad request"}, status=400)
 
-        # Validate HMAC signature FIRST (skip for INSECURE_NO_AUTH testing mode)
+        # Validate HMAC signature FIRST (skip only for the explicit local-test
+        # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
+        # not only during connect(), so direct handler reuse cannot turn a
+        # network webhook route into an unauthenticated agent-dispatch surface.
         secret = route_config.get("secret", self._global_secret)
-        if secret and secret != _INSECURE_NO_AUTH:
+        if not secret:
+            logger.error(
+                "[webhook] Route %s has no HMAC secret; refusing request",
+                route_name,
+            )
+            return web.json_response(
+                {"error": "Webhook route is missing an HMAC secret"},
+                status=403,
+            )
+        if secret != _INSECURE_NO_AUTH:
             if not self._validate_signature(request, raw_body, secret):
                 logger.warning(
                     "[webhook] Invalid signature for route %s", route_name
+                )
+                delivery_id = self._request_delivery_id(request)
+                event_type = self._request_event_type(request, {})
+                await self._emit_drip_envelope(
+                    route=route_name,
+                    event=event_type,
+                    outcome="rejected",
+                    delivery_id=delivery_id,
+                    severity="warning",
+                    payload=self._build_drip_payload(
+                        route_name,
+                        event_type,
+                        "rejected",
+                        delivery_id,
+                        {},
+                        reason="invalid_signature",
+                    ),
                 )
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
@@ -415,12 +573,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         # Check event type filter
-        event_type = (
-            request.headers.get("X-GitHub-Event", "")
-            or request.headers.get("X-GitLab-Event", "")
-            or payload.get("event_type", "")
-            or "unknown"
-        )
+        event_type = self._request_event_type(request, payload)
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -428,6 +581,16 @@ class WebhookAdapter(BasePlatformAdapter):
                 event_type,
                 route_name,
                 allowed_events,
+            )
+            delivery_id = self._request_delivery_id(request)
+            await self._emit_drip_envelope(
+                route=route_name,
+                event=event_type,
+                outcome="ignored",
+                delivery_id=delivery_id,
+                payload=self._build_drip_payload(
+                    route_name, event_type, "ignored", delivery_id, payload
+                ),
             )
             return web.json_response(
                 {"status": "ignored", "event": event_type}
@@ -471,7 +634,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # Build a unique delivery ID
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
         )
 
         # ── Idempotency ─────────────────────────────────────────
@@ -594,6 +760,16 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
+        await self._emit_drip_envelope(
+            route=route_name,
+            event=event_type,
+            outcome="accepted",
+            delivery_id=delivery_id,
+            payload=self._build_drip_payload(
+                route_name, event_type, "accepted", delivery_id, payload
+            ),
+        )
+
         # Non-blocking — return 202 Accepted immediately
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
@@ -616,7 +792,32 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, GitLab, Svix, generic HMAC-SHA256)."""
+        def _header(name: str) -> str:
+            return (
+                request.headers.get(name, "")
+                or request.headers.get(name.lower(), "")
+                or request.headers.get(name.upper(), "")
+            )
+
+        # Svix / AgentMail:
+        #   svix-id: msg_...
+        #   svix-timestamp: unix seconds
+        #   svix-signature: v1,<base64-hmac> [v1,<base64-hmac> ...]
+        # Signed content is: "{id}.{timestamp}.{raw_body}".  Svix secrets
+        # usually start with "whsec_" and the remainder is base64-encoded.
+        svix_id = _header("svix-id")
+        svix_timestamp = _header("svix-timestamp")
+        svix_signature = _header("svix-signature")
+        if svix_id or svix_timestamp or svix_signature:
+            return self._validate_svix_signature(
+                body=body,
+                secret=secret,
+                msg_id=svix_id,
+                timestamp=svix_timestamp,
+                signature_header=svix_signature,
+            )
+
         # GitHub: X-Hub-Signature-256 = sha256=<hex>
         gh_sig = request.headers.get("X-Hub-Signature-256", "")
         if gh_sig:
@@ -642,6 +843,56 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.debug(
             "[webhook] Secret configured but no signature header found"
         )
+        return False
+
+    def _validate_svix_signature(
+        self,
+        body: bytes,
+        secret: str,
+        msg_id: str,
+        timestamp: str,
+        signature_header: str,
+        tolerance_seconds: int = 300,
+    ) -> bool:
+        """Validate Svix-compatible signatures used by AgentMail webhooks."""
+        if not (msg_id and timestamp and signature_header and secret):
+            return False
+
+        try:
+            ts = int(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if abs(int(time.time()) - ts) > tolerance_seconds:
+            logger.warning("[webhook] Svix signature timestamp outside replay window")
+            return False
+
+        if secret.startswith("whsec_"):
+            encoded_secret = secret.removeprefix("whsec_")
+            try:
+                key = base64.b64decode(encoded_secret, validate=True)
+            except (binascii.Error, ValueError):
+                logger.debug("[webhook] Invalid whsec_ Svix signing secret")
+                return False
+        else:
+            # Be permissive for providers that document Svix-style headers but
+            # hand out raw shared secrets rather than whsec_ base64 secrets.
+            logger.debug("[webhook] Validating Svix-style signature with raw secret")
+            key = secret.encode()
+
+        signed_content = msg_id.encode() + b"." + timestamp.encode() + b"." + body
+        expected = base64.b64encode(
+            hmac.new(key, signed_content, hashlib.sha256).digest()
+        ).decode()
+
+        # Svix can send multiple signatures separated by spaces during secret
+        # rotation. Each entry is formatted as "vN,<base64>".
+        for part in signature_header.split():
+            try:
+                version, signature = part.split(",", 1)
+            except ValueError:
+                continue
+            if version == "v1" and hmac.compare_digest(signature, expected):
+                return True
         return False
 
     # ------------------------------------------------------------------
